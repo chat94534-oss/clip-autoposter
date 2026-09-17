@@ -112,6 +112,17 @@ FONT = (r"C\:/Windows/Fonts/arialbd.ttf" if os.name == "nt"
 # --------------------------------------------------------------------------- #
 # helpers (same shape as the other shorts-* channels)
 # --------------------------------------------------------------------------- #
+# This repository is public, which makes every Actions log world-readable.
+# Titles and video URLs would identify the channel on every run, so CI sets
+# REDACT_LOGS=1 and they are replaced with a stable id instead.
+REDACT = os.environ.get("REDACT_LOGS", "") == "1"
+
+
+def safe(text):
+    """Return text locally; a placeholder when logs are public."""
+    return "[redacted]" if REDACT else str(text)
+
+
 def log(msg):
     print(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
@@ -642,8 +653,8 @@ def append_history(clip_id, url, privacy):
     with open(HISTORY_CSV, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         if new:
-            w.writerow(["date", "clip_id", "privacy", "url"])
-        w.writerow([dt.datetime.now(TZ).date().isoformat(), clip_id, privacy, url])
+            w.writerow(["date", "clip_id", "privacy"])
+        w.writerow([dt.datetime.now(TZ).date().isoformat(), clip_id, privacy])
 
 
 def slots_filled_today():
@@ -699,13 +710,13 @@ def produce_one(candidates, state, args, publish_at):
         stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         run_dir = os.path.join(RUNS_DIR, f"{stamp}-{_slug(clip['broadcaster_name'])}")
         os.makedirs(run_dir, exist_ok=True)
-        log(f"Clip: {clip['broadcaster_name']} / {clip.get('game_name')} "
+        log(f"Clip: {safe(clip['broadcaster_name'])} / {safe(clip.get('game_name'))} "
             f"({int(clip['view_count']):,} views, {float(clip['duration']):.0f}s)")
         try:
             src = os.path.join(run_dir, "source.mp4")
             download_clip(clip["url"], src)
             copy = write_copy(clip)
-            log(f"  hook: {copy['hook']}")
+            log(f"  hook: {safe(copy['hook'])}")
             style = args.style or style_for(clip)
             cams = None
             if style == "fill":
@@ -721,7 +732,7 @@ def produce_one(candidates, state, args, publish_at):
                 else:
                     log("  no facecam found -> full-frame")
             intro_text, outro_text = vo_lines(clip, copy)
-            log(f"  vo: {intro_text}")
+            log(f"  vo: {safe(intro_text)}")
             vo = {
                 "intro_dur": make_vo(intro_text,
                                      os.path.join(run_dir, "vo_intro.mp3")),
@@ -740,13 +751,13 @@ def produce_one(candidates, state, args, publish_at):
         save_json(STATE_FILE, state)
 
         if args.no_upload:
-            log(f"Built (upload skipped): {video}")
+            log(f"Built (upload skipped): {safe(video)}")
             return video
 
         privacy = "private" if publish_at else args.privacy
         url = upload(video, copy, privacy, publish_at)
         append_history(clip["id"], url, "scheduled" if publish_at else privacy)
-        log(f"Posted: {url}")
+        log(f"Posted: {safe(url)}")
         return video
 
     raise RuntimeError("no usable candidates left in the pool")

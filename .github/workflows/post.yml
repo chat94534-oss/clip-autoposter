@@ -76,6 +76,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           X264_PRESET: fast
           PYTHONIOENCODING: utf-8
+          REDACT_LOGS: "1"
         run: |
           if [ "${{ github.event.inputs.fill_day }}" = "false" ]; then
             python make_clip.py --privacy "${{ github.event.inputs.privacy || 'public' }}"
