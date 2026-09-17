@@ -95,6 +95,15 @@ SPLIT_TOP_H = int(H * 0.35) // 2 * 2      # 672, kept even for libx264
 SPLIT_BOTTOM_H = H - SPLIT_TOP_H          # 1248
 STYLE = "auto"        # "auto" | "split" | "fill" (full-frame) | "blur" (letterboxed)
 
+# Original spoken commentary. This is what separates a repost from a video of
+# our own: YouTube's reused-content systems look for added value, and a clip
+# with our own narration over it is a different work from the raw clip.
+VO_VOICE = "en-US-BrianMultilingualNeural"
+VO_RATE = "+6%"
+VO_DUCK = 0.25      # clip audio level while the voiceover is speaking
+VO_GAP = 0.30       # breath between the last action and the outro line
+VO_OUTRO_SIZE = 56
+
 PRESET = os.environ.get("X264_PRESET", "medium")
 FONT = (r"C\:/Windows/Fonts/arialbd.ttf" if os.name == "nt"
         else "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf")
@@ -115,6 +124,25 @@ def run(cmd, cwd=None):
             f"STDERR:\n{p.stderr[-2000:]}"
         )
     return p
+
+
+def ffprobe_duration(path):
+    p = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path])
+    return float(p.stdout.strip())
+
+
+def has_audio(path):
+    p = run(["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index", "-of", "csv=p=0", path])
+    return bool(p.stdout.strip())
+
+
+def make_vo(text, out_path):
+    """Speak one line of commentary. Returns its duration in seconds."""
+    run([sys.executable, "-m", "edge_tts", "--voice", VO_VOICE,
+         f"--rate={VO_RATE}", "--text", text, "--write-media", out_path])
+    return ffprobe_duration(out_path)
 
 
 def load_json(path, default):
@@ -231,6 +259,35 @@ def _final_title(text, streamer):
     return f"{text[:70]} | {streamer} #shorts"[:100]
 
 
+VO_INTRO_FALLBACK = [
+    "{streamer} is on {game}, and this is the part everyone clipped.",
+    "This one blew up, and you only need a few seconds to see why.",
+    "{streamer} had no idea this was about to happen on {game}.",
+    "Keep your eyes on the middle of the screen for this one.",
+]
+VO_OUTRO_FALLBACK = [
+    "Would you have reacted any better?",
+    "Tell me what you would have done there.",
+    "That one is going to stay with them.",
+    "Watch that again, it is worse the second time.",
+]
+
+
+def vo_lines(clip, copy):
+    """The two spoken lines, from the copy model or a deterministic fallback."""
+    streamer = clip["broadcaster_name"]
+    game = clip.get("game_name") or "stream"
+    idx = sum(ord(c) for c in str(clip.get("id", "")))
+    intro = copy.get("vo_intro") or ""
+    outro = copy.get("vo_outro") or ""
+    if len(intro) < 15:
+        intro = VO_INTRO_FALLBACK[idx % len(VO_INTRO_FALLBACK)].format(
+            streamer=streamer, game=game)
+    if len(outro) < 10:
+        outro = VO_OUTRO_FALLBACK[idx % len(VO_OUTRO_FALLBACK)]
+    return intro, outro
+
+
 def write_copy(clip):
     """Hook line for the video, plus title/description/tags for YouTube.
 
@@ -272,7 +329,9 @@ def write_copy(clip):
     tags = [t for t in [game, streamer, "twitch", "twitch clips", "gaming",
                         "shorts", "funny moments"] if t]
     return {"hook": hook, "title": title, "description": description,
-            "tags": tags, "credit": f"@{streamer}"}
+            "tags": tags, "credit": f"@{streamer}",
+            "vo_intro": (written or {}).get("vo_intro", ""),
+            "vo_outro": (written or {}).get("vo_outro", "")}
 
 
 # --------------------------------------------------------------------------- #
@@ -461,7 +520,8 @@ def fit_hook(text, max_lines=2):
     return textwrap.fill(trimmed, per_line), HOOK_SIZES[-1]
 
 
-def render(src, run_dir, copy, out_name="short.mp4", style=None, cams=None):
+def render(src, run_dir, copy, out_name="short.mp4", style=None, cams=None,
+           vo=None):
     """One ffmpeg pass to a finished 1080x1920 Short.
 
     Text comes from files rather than inline strings so drawtext's escaping
@@ -485,8 +545,54 @@ def render(src, run_dir, copy, out_name="short.mp4", style=None, cams=None):
         vf = _fill_chain(hook_size)
     else:
         vf = _blur_chain(hook_size)
-    run(["ffmpeg", "-y", "-i", os.path.basename(src),
-         "-filter_complex", vf, "-map", "[v]", "-map", "0:a?",
+
+    inputs = ["-i", os.path.basename(src)]
+    amap = "0:a?"
+    if vo:
+        dur = ffprobe_duration(src)
+        # The outro lands at the end, but never on top of the intro line.
+        o_start = max(dur - vo["outro_dur"] - VO_GAP,
+                      vo["intro_dur"] + 0.5)
+        o_start = min(o_start, max(dur - 0.4, 0.1))
+        o_ms = int(o_start * 1000)
+
+        # Caption the spoken outro. It sits above YouTube's bottom UI strip.
+        wrapped = textwrap.fill(vo["outro_text"].upper(), 24)
+        with open(os.path.join(run_dir, "outro.txt"), "w", encoding="utf-8",
+                  newline=chr(10)) as f:
+            f.write(wrapped)
+        dt_outro = (
+            f"drawtext=fontfile='{FONT}':textfile='outro.txt':"
+            f"fontsize={VO_OUTRO_SIZE}:fontcolor=white:borderw=6:"
+            f"bordercolor=black:shadowcolor=black@0.8:shadowx=3:shadowy=3:"
+            f"line_spacing=10:x=(w-text_w)/2:y=h-480-text_h:"
+            f"enable='between(t\,{o_start:.2f}\,{dur:.2f})'")
+        if vf.endswith("[v]"):
+            vf = vf[:-3] + f",{dt_outro}[v]"
+
+        inputs += ["-i", "vo_intro.mp3", "-i", "vo_outro.mp3"]
+        fmt = "aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo"
+        parts = []
+        mix = []
+        if has_audio(src):
+            # Duck the clip under each spoken line instead of muting it — the
+            # crowd/game audio is half the moment, it just cannot compete.
+            parts.append(
+                f"[0:a]{fmt},"
+                f"volume={VO_DUCK}:enable='between(t\,0\,{vo['intro_dur']:.2f})',"
+                f"volume={VO_DUCK}:enable='between(t\,{o_start:.2f}\,{dur:.2f})'"
+                f"[orig]")
+            mix.append("[orig]")
+        parts.append(f"[1:a]{fmt}[vi]")
+        parts.append(f"[2:a]{fmt},adelay={o_ms}|{o_ms}[vo]")
+        mix += ["[vi]", "[vo]"]
+        parts.append(f"{''.join(mix)}amix=inputs={len(mix)}:duration=first:"
+                     f"normalize=0,alimiter=limit=0.95[a]")
+        vf = vf + ";" + ";".join(parts)
+        amap = "[a]"
+
+    run(["ffmpeg", "-y", *inputs,
+         "-filter_complex", vf, "-map", "[v]", "-map", amap,
          "-r", str(FPS), "-c:v", "libx264", "-preset", PRESET, "-crf", "18",
          "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
          "-movflags", "+faststart", out_name], cwd=run_dir)
@@ -614,7 +720,16 @@ def produce_one(candidates, state, args, publish_at):
                         "using full-frame")
                 else:
                     log("  no facecam found -> full-frame")
-            video = render(src, run_dir, copy, style=style, cams=cams)
+            intro_text, outro_text = vo_lines(clip, copy)
+            log(f"  vo: {intro_text}")
+            vo = {
+                "intro_dur": make_vo(intro_text,
+                                     os.path.join(run_dir, "vo_intro.mp3")),
+                "outro_dur": make_vo(outro_text,
+                                     os.path.join(run_dir, "vo_outro.mp3")),
+                "outro_text": outro_text,
+            }
+            video = render(src, run_dir, copy, style=style, cams=cams, vo=vo)
         except Exception as e:  # noqa: BLE001
             log(f"  clip failed ({e}); marking spent and taking the next one.")
             state.setdefault("seen", []).append(clip["id"])

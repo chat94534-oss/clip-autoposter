@@ -28,6 +28,9 @@ TIMEOUT = 25
 RETRY_WAIT = 20
 HOOK_LIMIT = 30
 TITLE_LIMIT = 70
+VO_INTRO_LIMIT = 120   # ~4s of speech
+VO_OUTRO_LIMIT = 70    # ~2.5s of speech
+JSON_ONLY = (chr(10) + chr(10) + "Return ONLY the JSON object, no prose and no code fences.")
 
 PROMPT = """You write copy for a YouTube Shorts channel that reposts the top \
 Twitch clips.
@@ -48,7 +51,11 @@ words a 13-year-old says out loud.
 may name the streamer or game since people search those. No emoji, no \
 hashtags, no clickbait that the clip does not deliver.
 
-Both must be honest about what the clip shows."""
+"vo_intro" - ONE sentence of original spoken commentary, read aloud over the first seconds. HARD LIMIT {vo_intro_limit} characters. Set the moment up and make the viewer need to see what happens. You may name the streamer or the game. Conversational, like a friend narrating over your shoulder. Never describe the payoff itself. No emoji, no hashtags, no quotes.
+
+"vo_outro" - ONE short spoken reaction read aloud at the end. HARD LIMIT {vo_outro_limit} characters. React to what happened and invite a reply — a question works well. No emoji, no hashtags, no quotes.
+
+All four must be honest about what the clip shows."""
 
 
 def _clean(text, limit):
@@ -64,12 +71,13 @@ def write(streamer, game, title, key=None):
     if key is None:
         key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not key:
-        return None
+        return _pollinations(streamer, game, title)
 
     body = json.dumps({
         "contents": [{"parts": [{"text": PROMPT.format(
             streamer=streamer, game=game, title=title,
-            hook_limit=HOOK_LIMIT, title_limit=TITLE_LIMIT)}]}],
+            hook_limit=HOOK_LIMIT, title_limit=TITLE_LIMIT,
+            vo_intro_limit=VO_INTRO_LIMIT, vo_outro_limit=VO_OUTRO_LIMIT)}]}],
         "generationConfig": {
             "responseMimeType": "application/json",
             "temperature": 1.0,
@@ -97,16 +105,57 @@ def write(streamer, game, title, key=None):
         out = json.loads(text)
         hook = _clean(out.get("hook"), HOOK_LIMIT)
         headline = _clean(out.get("title"), TITLE_LIMIT)
+        vo_intro = _clean(out.get("vo_intro"), VO_INTRO_LIMIT)
+        vo_outro = _clean(out.get("vo_outro"), VO_OUTRO_LIMIT)
     except (urllib.error.URLError, urllib.error.HTTPError, OSError,
             KeyError, IndexError, ValueError, TypeError) as e:
         # A blocked or malformed response costs the nicer hook, not the video.
         print(f"  gemini: {type(e).__name__}: {e}", flush=True)
-        return None
+        return _pollinations(streamer, game, title)
 
     # A two-word hook is worse than the streamer's own title.
     if len(hook) < 8 or len(headline) < 8:
+        return _pollinations(streamer, game, title)
+    return {"hook": hook, "title": headline,
+            "vo_intro": vo_intro, "vo_outro": vo_outro}
+
+
+def _pollinations(streamer, game, title):
+    """Keyless free-tier fallback for the same four fields. None if it fails."""
+    body = json.dumps({
+        "model": "openai-fast",
+        "messages": [{"role": "user", "content": PROMPT.format(
+            streamer=streamer, game=game, title=title,
+            hook_limit=HOOK_LIMIT, title_limit=TITLE_LIMIT,
+            vo_intro_limit=VO_INTRO_LIMIT, vo_outro_limit=VO_OUTRO_LIMIT)
+            + JSON_ONLY}],
+    }).encode()
+    req = urllib.request.Request(
+        "https://text.pollinations.ai/openai", data=body,
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "Mozilla/5.0 (shorts-pipeline)"})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            raw = json.loads(r.read().decode("utf-8", "replace"))
+        msg = (raw.get("choices") or [{}])[0].get("message") or {}
+        # Reasoning models sometimes put the answer in "reasoning" and leave
+        # "content" empty, so take whichever field actually has the JSON.
+        text = msg.get("content") or msg.get("reasoning") or ""
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        out = json.loads(text[start:end + 1])
+        hook = _clean(out.get("hook"), HOOK_LIMIT)
+        headline = _clean(out.get("title"), TITLE_LIMIT)
+        if len(hook) < 8 or len(headline) < 8:
+            return None
+        return {"hook": hook, "title": headline,
+                "vo_intro": _clean(out.get("vo_intro"), VO_INTRO_LIMIT),
+                "vo_outro": _clean(out.get("vo_outro"), VO_OUTRO_LIMIT)}
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError,
+            KeyError, IndexError, ValueError, TypeError) as e:
+        print(f"  pollinations: {type(e).__name__}: {e}", flush=True)
         return None
-    return {"hook": hook, "title": headline}
 
 
 def demo():
